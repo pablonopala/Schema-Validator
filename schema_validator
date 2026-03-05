@@ -62,17 +62,18 @@ def detect_format(series):
         return "empty"
 
     sample = s.head(1000)
+    sample_str = sample.cast(str)
 
     try:
         sample.cast(pl.Float64)
         return "numeric"
-    except:
+    except pl.exceptions.InvalidOperationError:
         pass
 
-    if sample.cast(str).str.contains(r"\d{4}-\d{2}-\d{2}").mean() > 0.7:
+    if sample_str.str.contains(r"\d{4}-\d{2}-\d{2}").mean() > 0.7:
         return "date"
 
-    if sample.cast(str).str.contains(r"^\d+\.\d{2}$").mean() > 0.7:
+    if sample_str.str.contains(r"^\d+\.\d{2}$").mean() > 0.7:
         return "monetary"
 
     unique_ratio = sample.n_unique() / len(sample)
@@ -98,13 +99,34 @@ def header_similarity(a, b):
 # ---------------------------------------------------------
 # SEMANTIC COLUMN SIMILARITY
 # ---------------------------------------------------------
-def semantic_similarity(col1, col2):
+def compute_similarity_matrix(prev_cols, new_cols):
 
-    emb = model.encode([col1, col2])
+    unique_cols = list(dict.fromkeys(prev_cols + new_cols))
+    embeddings = model.encode(unique_cols)
+    emb_by_col = {
+        col: emb for col, emb in zip(unique_cols, embeddings)
+    }
 
-    score = cosine_similarity([emb[0]], [emb[1]])[0][0]
+    similarity_lookup = {}
 
-    return float(score)
+    for p in prev_cols:
+
+        p_emb = emb_by_col[p]
+
+        for n in new_cols:
+
+            n_emb = emb_by_col[n]
+
+            header_sim = header_similarity(p, n)
+            semantic_sim = float(cosine_similarity([p_emb], [n_emb])[0][0])
+
+            similarity_lookup[(p, n)] = {
+                "header_similarity": round(header_sim, 3),
+                "semantic_similarity": round(semantic_sim, 3),
+                "semantic_similarity_raw": semantic_sim,
+            }
+
+    return similarity_lookup
 
 
 # ---------------------------------------------------------
@@ -223,20 +245,19 @@ def analyze(previous_file, refresh_file, output_folder):
     # COLUMN SIMILARITY
     # -----------------------------------------------------
     similarity_rows = []
+    similarity_lookup = compute_similarity_matrix(prev_cols, new_cols)
 
     for p in prev_cols:
 
         for n in new_cols:
 
-            header_sim = header_similarity(p, n)
-
-            semantic_sim = semantic_similarity(p, n)
+            similarity = similarity_lookup[(p, n)]
 
             similarity_rows.append({
                 "previous_column": p,
                 "refresh_column": n,
-                "header_similarity": round(header_sim, 3),
-                "semantic_similarity": round(semantic_sim, 3)
+                "header_similarity": similarity["header_similarity"],
+                "semantic_similarity": similarity["semantic_similarity"]
             })
 
     similarity_df = pd.DataFrame(similarity_rows)
@@ -253,9 +274,9 @@ def analyze(previous_file, refresh_file, output_folder):
 
         for n in new_cols:
 
-            header_score = header_similarity(p, n)
-
-            semantic_score = semantic_similarity(p, n)
+            similarity = similarity_lookup[(p, n)]
+            header_score = similarity["header_similarity"]
+            semantic_score = similarity["semantic_similarity_raw"]
 
             format_score = 1 if prev_formats[p] == new_formats.get(n) else 0
 
