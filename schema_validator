@@ -1,0 +1,335 @@
+import polars as pl
+import pandas as pd
+import difflib
+import tkinter as tk
+from tkinter import filedialog
+import os
+import threading
+import re
+
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+# ---------------------------------------------------------
+# PARAMETERS
+# ---------------------------------------------------------
+SAMPLE_SIZE = 100000
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+
+# ---------------------------------------------------------
+# CURRENCY STRUCTURE DETECTION
+# ---------------------------------------------------------
+def detect_currency_structure(series):
+
+    s = series.drop_nulls()
+
+    if len(s) == 0:
+        return "empty"
+
+    sample = s.head(1000).cast(str)
+
+    if sample.str.contains(r"^[A-Z]{3}$").mean() > 0.7:
+        return "currency_code"
+
+    if sample.str.contains(r"^[A-Z]{3}\s-\s").mean() > 0.7:
+        return "currency_with_description"
+
+    if sample.str.contains(r"^[0-9]{3}$").mean() > 0.7:
+        return "currency_numeric"
+
+    if sample.str.contains(r"\([A-Za-z ]+\)").mean() > 0.7:
+        return "currency_extended"
+
+    return None
+
+
+# ---------------------------------------------------------
+# GENERAL FORMAT DETECTOR
+# ---------------------------------------------------------
+def detect_format(series):
+
+    currency = detect_currency_structure(series)
+
+    if currency:
+        return currency
+
+    s = series.drop_nulls()
+
+    if len(s) == 0:
+        return "empty"
+
+    sample = s.head(1000)
+
+    try:
+        sample.cast(pl.Float64)
+        return "numeric"
+    except:
+        pass
+
+    if sample.cast(str).str.contains(r"\d{4}-\d{2}-\d{2}").mean() > 0.7:
+        return "date"
+
+    if sample.cast(str).str.contains(r"^\d+\.\d{2}$").mean() > 0.7:
+        return "monetary"
+
+    unique_ratio = sample.n_unique() / len(sample)
+
+    if unique_ratio < 0.1:
+        return "categorical"
+
+    return "text"
+
+
+# ---------------------------------------------------------
+# HEADER SIMILARITY
+# ---------------------------------------------------------
+def header_similarity(a, b):
+
+    return difflib.SequenceMatcher(
+        None,
+        a.lower(),
+        b.lower()
+    ).ratio()
+
+
+# ---------------------------------------------------------
+# SEMANTIC COLUMN SIMILARITY
+# ---------------------------------------------------------
+def semantic_similarity(col1, col2):
+
+    emb = model.encode([col1, col2])
+
+    score = cosine_similarity([emb[0]], [emb[1]])[0][0]
+
+    return float(score)
+
+
+# ---------------------------------------------------------
+# LOAD SAMPLE
+# ---------------------------------------------------------
+def load_sample(path):
+
+    if path.endswith(".parquet"):
+        df = pl.scan_parquet(path)
+    else:
+        df = pl.scan_csv(
+            path,
+            ignore_errors=True,
+            encoding="utf8-lossy"
+        )
+
+    return df.limit(SAMPLE_SIZE).collect(streaming=True)
+
+
+# ---------------------------------------------------------
+# CONVERT TO PARQUET
+# ---------------------------------------------------------
+def convert_to_parquet(file_path):
+
+    parquet_path = file_path + ".parquet"
+
+    if os.path.exists(parquet_path):
+        return parquet_path
+
+    print("Converting to parquet:", file_path)
+
+    df = pl.read_csv(
+        file_path,
+        ignore_errors=True,
+        encoding="utf8-lossy"
+    )
+
+    df.write_parquet(parquet_path)
+
+    return parquet_path
+
+
+# ---------------------------------------------------------
+# ANALYSIS ENGINE
+# ---------------------------------------------------------
+def analyze(previous_file, refresh_file, output_folder):
+
+    print("Preparing files...")
+
+    previous_file = convert_to_parquet(previous_file)
+    refresh_file = convert_to_parquet(refresh_file)
+
+    prev_sample = load_sample(previous_file)
+    new_sample = load_sample(refresh_file)
+
+    prev_cols = prev_sample.columns
+    new_cols = new_sample.columns
+
+    # -----------------------------------------------------
+    # COLUMN ORDER VALIDATION
+    # -----------------------------------------------------
+    order_results = []
+
+    max_len = max(len(prev_cols), len(new_cols))
+
+    for i in range(max_len):
+
+        prev = prev_cols[i] if i < len(prev_cols) else ""
+        new = new_cols[i] if i < len(new_cols) else ""
+
+        status = "OK" if prev == new else "DIFFERENT"
+
+        order_results.append({
+            "position": i + 1,
+            "previous_column": prev,
+            "refresh_column": new,
+            "status": status
+        })
+
+    order_df = pd.DataFrame(order_results)
+
+    # -----------------------------------------------------
+    # MISSING / EXTRA
+    # -----------------------------------------------------
+    missing_cols = list(set(prev_cols) - set(new_cols))
+    extra_cols = list(set(new_cols) - set(prev_cols))
+
+    missing_df = pd.DataFrame({"missing_columns": missing_cols})
+    extra_df = pd.DataFrame({"extra_columns": extra_cols})
+
+    # -----------------------------------------------------
+    # FORMAT DETECTION
+    # -----------------------------------------------------
+    prev_formats = {}
+    new_formats = {}
+
+    for col in prev_cols:
+        prev_formats[col] = detect_format(prev_sample[col])
+
+    for col in new_cols:
+        new_formats[col] = detect_format(new_sample[col])
+
+    format_rows = []
+
+    for col in prev_cols:
+
+        format_rows.append({
+            "column": col,
+            "previous_format": prev_formats[col],
+            "refresh_format": new_formats.get(col, "missing")
+        })
+
+    format_df = pd.DataFrame(format_rows)
+
+    # -----------------------------------------------------
+    # COLUMN SIMILARITY
+    # -----------------------------------------------------
+    similarity_rows = []
+
+    for p in prev_cols:
+
+        for n in new_cols:
+
+            header_sim = header_similarity(p, n)
+
+            semantic_sim = semantic_similarity(p, n)
+
+            similarity_rows.append({
+                "previous_column": p,
+                "refresh_column": n,
+                "header_similarity": round(header_sim, 3),
+                "semantic_similarity": round(semantic_sim, 3)
+            })
+
+    similarity_df = pd.DataFrame(similarity_rows)
+
+    # -----------------------------------------------------
+    # AI COLUMN MAPPING
+    # -----------------------------------------------------
+    mapping_rows = []
+
+    for p in prev_cols:
+
+        best_match = None
+        best_score = 0
+
+        for n in new_cols:
+
+            header_score = header_similarity(p, n)
+
+            semantic_score = semantic_similarity(p, n)
+
+            format_score = 1 if prev_formats[p] == new_formats.get(n) else 0
+
+            score = (semantic_score * 0.5) + (header_score * 0.3) + (format_score * 0.2)
+
+            if score > best_score:
+
+                best_score = score
+                best_match = n
+
+        mapping_rows.append({
+            "previous_column": p,
+            "suggested_refresh_column": best_match,
+            "confidence_score": round(best_score, 3),
+            "previous_format": prev_formats[p],
+            "refresh_format": new_formats.get(best_match, "")
+        })
+
+    mapping_df = pd.DataFrame(mapping_rows)
+
+    # -----------------------------------------------------
+    # SAVE REPORT
+    # -----------------------------------------------------
+    output_path = os.path.join(
+        output_folder,
+        "etl_schema_analysis.xlsx"
+    )
+
+    with pd.ExcelWriter(output_path) as writer:
+
+        order_df.to_excel(writer, sheet_name="column_order", index=False)
+        missing_df.to_excel(writer, sheet_name="missing_columns", index=False)
+        extra_df.to_excel(writer, sheet_name="extra_columns", index=False)
+        format_df.to_excel(writer, sheet_name="format_analysis", index=False)
+        similarity_df.to_excel(writer, sheet_name="column_similarity", index=False)
+        mapping_df.to_excel(writer, sheet_name="embedding_mapping", index=False)
+
+    print("Analysis complete:", output_path)
+
+
+# ---------------------------------------------------------
+# TKINTER UI
+# ---------------------------------------------------------
+def run_ui():
+
+    root = tk.Tk()
+    root.withdraw()
+
+    prev_file = filedialog.askopenfilename(
+        title="Select PREVIOUS dataset"
+    )
+
+    new_file = filedialog.askopenfilename(
+        title="Select REFRESH dataset"
+    )
+
+    output_folder = filedialog.askdirectory(
+        title="Select OUTPUT folder"
+    )
+
+    def run():
+
+        analyze(prev_file, new_file, output_folder)
+
+        print("Finished.")
+        root.quit()
+
+    threading.Thread(target=run).start()
+
+    root.mainloop()
+
+
+# ---------------------------------------------------------
+# RUN
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    run_ui()
