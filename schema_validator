@@ -1,12 +1,13 @@
-import polars as pl
-import pandas as pd
+import datetime as dt
 import difflib
+import os
+import re
+import threading
 import tkinter as tk
 from tkinter import filedialog
-import os
-import threading
-import re
 
+import pandas as pd
+import polars as pl
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -15,6 +16,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 # PARAMETERS
 # ---------------------------------------------------------
 SAMPLE_SIZE = 100000
+SUPPORTED_EXTENSIONS = {".csv", ".parquet"}
+DATE_SUFFIX_PATTERN = re.compile(r"_(\d{8})_(\d{6})$")
 
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -151,6 +154,9 @@ def load_sample(path):
 # ---------------------------------------------------------
 def convert_to_parquet(file_path):
 
+    if file_path.endswith(".parquet"):
+        return file_path
+
     parquet_path = file_path + ".parquet"
 
     if os.path.exists(parquet_path):
@@ -169,12 +175,70 @@ def convert_to_parquet(file_path):
     return parquet_path
 
 
+def normalize_file_key(file_name):
+
+    stem = os.path.splitext(file_name)[0]
+
+    if DATE_SUFFIX_PATTERN.search(stem):
+        stem = DATE_SUFFIX_PATTERN.sub("", stem)
+
+    return stem.lower()
+
+
+def extract_timestamp(file_name):
+
+    stem = os.path.splitext(file_name)[0]
+    match = DATE_SUFFIX_PATTERN.search(stem)
+
+    if not match:
+        return dt.datetime.min
+
+    return dt.datetime.strptime(
+        f"{match.group(1)}_{match.group(2)}",
+        "%d%m%Y_%H%M%S"
+    )
+
+
+def index_folder_files(folder_path):
+
+    indexed = {}
+
+    for entry in os.scandir(folder_path):
+
+        if not entry.is_file():
+            continue
+
+        extension = os.path.splitext(entry.name)[1].lower()
+
+        if extension not in SUPPORTED_EXTENSIONS:
+            continue
+
+        key = normalize_file_key(entry.name)
+        timestamp = extract_timestamp(entry.name)
+
+        previous = indexed.get(key)
+
+        if previous is None or timestamp >= previous["timestamp"]:
+            indexed[key] = {
+                "path": entry.path,
+                "name": entry.name,
+                "timestamp": timestamp
+            }
+
+    return indexed
+
+
+def safe_sheet_name(name):
+
+    return re.sub(r"[\\/*?:\[\]]", "_", name)[:31]
+
+
 # ---------------------------------------------------------
 # ANALYSIS ENGINE
 # ---------------------------------------------------------
-def analyze(previous_file, refresh_file, output_folder):
+def analyze_file_pair(previous_file, refresh_file, output_path):
 
-    print("Preparing files...")
+    print("Preparing files:", os.path.basename(previous_file), "vs", os.path.basename(refresh_file))
 
     previous_file = convert_to_parquet(previous_file)
     refresh_file = convert_to_parquet(refresh_file)
@@ -244,6 +308,7 @@ def analyze(previous_file, refresh_file, output_folder):
     # -----------------------------------------------------
     # COLUMN SIMILARITY
     # -----------------------------------------------------
+    similarity_lookup = compute_similarity_matrix(prev_cols, new_cols)
     similarity_rows = []
     similarity_lookup = compute_similarity_matrix(prev_cols, new_cols)
 
@@ -300,11 +365,6 @@ def analyze(previous_file, refresh_file, output_folder):
     # -----------------------------------------------------
     # SAVE REPORT
     # -----------------------------------------------------
-    output_path = os.path.join(
-        output_folder,
-        "etl_schema_analysis.xlsx"
-    )
-
     with pd.ExcelWriter(output_path) as writer:
 
         order_df.to_excel(writer, sheet_name="column_order", index=False)
@@ -316,6 +376,84 @@ def analyze(previous_file, refresh_file, output_folder):
 
     print("Analysis complete:", output_path)
 
+    return {
+        "previous_columns": len(prev_cols),
+        "refresh_columns": len(new_cols),
+        "missing_columns": len(missing_cols),
+        "extra_columns": len(extra_cols)
+    }
+
+
+def analyze_folder_pairs(previous_folder, refresh_folder, output_folder):
+
+    print("Indexing folders...")
+
+    previous_index = index_folder_files(previous_folder)
+    refresh_index = index_folder_files(refresh_folder)
+
+    previous_keys = set(previous_index.keys())
+    refresh_keys = set(refresh_index.keys())
+
+    matched_keys = sorted(previous_keys & refresh_keys)
+    missing_in_refresh = sorted(previous_keys - refresh_keys)
+    extra_in_refresh = sorted(refresh_keys - previous_keys)
+
+    summary_rows = []
+
+    for key in matched_keys:
+
+        previous_item = previous_index[key]
+        refresh_item = refresh_index[key]
+
+        report_name = f"etl_schema_analysis_{safe_sheet_name(key)}.xlsx"
+        report_path = os.path.join(output_folder, report_name)
+
+        stats = analyze_file_pair(
+            previous_item["path"],
+            refresh_item["path"],
+            report_path
+        )
+
+        summary_rows.append({
+            "dataset_key": key,
+            "previous_file": previous_item["name"],
+            "refresh_file": refresh_item["name"],
+            "status": "analyzed",
+            "report_path": report_path,
+            **stats
+        })
+
+    for key in missing_in_refresh:
+        summary_rows.append({
+            "dataset_key": key,
+            "previous_file": previous_index[key]["name"],
+            "refresh_file": "",
+            "status": "missing_in_refresh",
+            "report_path": "",
+            "previous_columns": "",
+            "refresh_columns": "",
+            "missing_columns": "",
+            "extra_columns": ""
+        })
+
+    for key in extra_in_refresh:
+        summary_rows.append({
+            "dataset_key": key,
+            "previous_file": "",
+            "refresh_file": refresh_index[key]["name"],
+            "status": "extra_in_refresh",
+            "report_path": "",
+            "previous_columns": "",
+            "refresh_columns": "",
+            "missing_columns": "",
+            "extra_columns": ""
+        })
+
+    summary_path = os.path.join(output_folder, "etl_schema_batch_summary.xlsx")
+    pd.DataFrame(summary_rows).to_excel(summary_path, index=False)
+
+    print("Batch analysis complete:", summary_path)
+
 
 # ---------------------------------------------------------
 # TKINTER UI
@@ -325,12 +463,12 @@ def run_ui():
     root = tk.Tk()
     root.withdraw()
 
-    prev_file = filedialog.askopenfilename(
-        title="Select PREVIOUS dataset"
+    previous_folder = filedialog.askdirectory(
+        title="Select PREVIOUS refresh folder"
     )
 
-    new_file = filedialog.askopenfilename(
-        title="Select REFRESH dataset"
+    refresh_folder = filedialog.askdirectory(
+        title="Select CURRENT refresh folder"
     )
 
     output_folder = filedialog.askdirectory(
@@ -339,7 +477,7 @@ def run_ui():
 
     def run():
 
-        analyze(prev_file, new_file, output_folder)
+        analyze_folder_pairs(previous_folder, refresh_folder, output_folder)
 
         print("Finished.")
         root.quit()
