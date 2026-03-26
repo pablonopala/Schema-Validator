@@ -1,494 +1,192 @@
-import datetime as dt
-import difflib
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import polars as pl
 import os
 import re
-import threading
-import tkinter as tk
-from tkinter import filedialog
+import hashlib
+from sentence_transformers import SentenceTransformer, util
 
-import pandas as pd
-import polars as pl
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+# =========================
+# CONFIG
+# =========================
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
+MODEL_NAME = "all-MiniLM-L6-v2"
+SIM_THRESHOLD_HIGH = 0.85
+SIM_THRESHOLD_LOW = 0.65
 
-# ---------------------------------------------------------
-# PARAMETERS
-# ---------------------------------------------------------
-SAMPLE_SIZE = 100000
-SUPPORTED_EXTENSIONS = {".csv", ".parquet"}
-DATE_SUFFIX_PATTERN = re.compile(r"_(\d{8})_(\d{6})$")
+# Load model once
+model = SentenceTransformer(MODEL_NAME)
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+# =========================
+# FILE HANDLING
+# =========================
+def get_cache_path(file_path):
+    hash_name = hashlib.md5(file_path.encode()).hexdigest()
+    return os.path.join(CACHE_DIR, f"{hash_name}.csv")
 
+def convert_to_csv(file_path):
+    cached_path = get_cache_path(file_path)
 
-# ---------------------------------------------------------
-# CURRENCY STRUCTURE DETECTION
-# ---------------------------------------------------------
-def detect_currency_structure(series):
+    if os.path.exists(cached_path):
+        return cached_path
 
-    s = series.drop_nulls()
-
-    if len(s) == 0:
-        return "empty"
-
-    sample = s.head(1000).cast(str)
-
-    if sample.str.contains(r"^[A-Z]{3}$").mean() > 0.7:
-        return "currency_code"
-
-    if sample.str.contains(r"^[A-Z]{3}\s-\s").mean() > 0.7:
-        return "currency_with_description"
-
-    if sample.str.contains(r"^[0-9]{3}$").mean() > 0.7:
-        return "currency_numeric"
-
-    if sample.str.contains(r"\([A-Za-z ]+\)").mean() > 0.7:
-        return "currency_extended"
-
-    return None
-
-
-# ---------------------------------------------------------
-# GENERAL FORMAT DETECTOR
-# ---------------------------------------------------------
-def detect_format(series):
-
-    currency = detect_currency_structure(series)
-
-    if currency:
-        return currency
-
-    s = series.drop_nulls()
-
-    if len(s) == 0:
-        return "empty"
-
-    sample = s.head(1000)
-    sample_str = sample.cast(str)
-
-    try:
-        sample.cast(pl.Float64)
-        return "numeric"
-    except pl.exceptions.InvalidOperationError:
-        pass
-
-    if sample_str.str.contains(r"\d{4}-\d{2}-\d{2}").mean() > 0.7:
-        return "date"
-
-    if sample_str.str.contains(r"^\d+\.\d{2}$").mean() > 0.7:
-        return "monetary"
-
-    unique_ratio = sample.n_unique() / len(sample)
-
-    if unique_ratio < 0.1:
-        return "categorical"
-
-    return "text"
-
-
-# ---------------------------------------------------------
-# HEADER SIMILARITY
-# ---------------------------------------------------------
-def header_similarity(a, b):
-
-    return difflib.SequenceMatcher(
-        None,
-        a.lower(),
-        b.lower()
-    ).ratio()
-
-
-# ---------------------------------------------------------
-# SEMANTIC COLUMN SIMILARITY
-# ---------------------------------------------------------
-def compute_similarity_matrix(prev_cols, new_cols):
-
-    unique_cols = list(dict.fromkeys(prev_cols + new_cols))
-    embeddings = model.encode(unique_cols)
-    emb_by_col = {
-        col: emb for col, emb in zip(unique_cols, embeddings)
-    }
-
-    similarity_lookup = {}
-
-    for p in prev_cols:
-
-        p_emb = emb_by_col[p]
-
-        for n in new_cols:
-
-            n_emb = emb_by_col[n]
-
-            header_sim = header_similarity(p, n)
-            semantic_sim = float(cosine_similarity([p_emb], [n_emb])[0][0])
-
-            similarity_lookup[(p, n)] = {
-                "header_similarity": round(header_sim, 3),
-                "semantic_similarity": round(semantic_sim, 3),
-                "semantic_similarity_raw": semantic_sim,
-            }
-
-    return similarity_lookup
-
-
-# ---------------------------------------------------------
-# LOAD SAMPLE
-# ---------------------------------------------------------
-def load_sample(path):
-
-    if path.endswith(".parquet"):
-        df = pl.scan_parquet(path)
-    else:
-        df = pl.scan_csv(
-            path,
-            ignore_errors=True,
-            encoding="utf8-lossy"
-        )
-
-    return df.limit(SAMPLE_SIZE).collect(streaming=True)
-
-
-# ---------------------------------------------------------
-# CONVERT TO PARQUET
-# ---------------------------------------------------------
-def convert_to_parquet(file_path):
-
-    if file_path.endswith(".parquet"):
+    if file_path.lower().endswith(".csv"):
         return file_path
 
-    parquet_path = file_path + ".parquet"
-
-    if os.path.exists(parquet_path):
-        return parquet_path
-
-    print("Converting to parquet:", file_path)
-
-    df = pl.read_csv(
-        file_path,
-        ignore_errors=True,
-        encoding="utf8-lossy"
-    )
-
-    df.write_parquet(parquet_path)
-
-    return parquet_path
-
-
-def normalize_file_key(file_name):
-
-    stem = os.path.splitext(file_name)[0]
-
-    if DATE_SUFFIX_PATTERN.search(stem):
-        stem = DATE_SUFFIX_PATTERN.sub("", stem)
-
-    return stem.lower()
-
-
-def extract_timestamp(file_name):
-
-    stem = os.path.splitext(file_name)[0]
-    match = DATE_SUFFIX_PATTERN.search(stem)
-
-    if not match:
-        return dt.datetime.min
-
-    return dt.datetime.strptime(
-        f"{match.group(1)}_{match.group(2)}",
-        "%d%m%Y_%H%M%S"
-    )
-
-
-def index_folder_files(folder_path):
-
-    indexed = {}
-
-    for entry in os.scandir(folder_path):
-
-        if not entry.is_file():
-            continue
-
-        extension = os.path.splitext(entry.name)[1].lower()
-
-        if extension not in SUPPORTED_EXTENSIONS:
-            continue
-
-        key = normalize_file_key(entry.name)
-        timestamp = extract_timestamp(entry.name)
-
-        previous = indexed.get(key)
-
-        if previous is None or timestamp >= previous["timestamp"]:
-            indexed[key] = {
-                "path": entry.path,
-                "name": entry.name,
-                "timestamp": timestamp
-            }
-
-    return indexed
-
-
-def safe_sheet_name(name):
-
-    return re.sub(r"[\\/*?:\[\]]", "_", name)[:31]
-
-
-# ---------------------------------------------------------
-# ANALYSIS ENGINE
-# ---------------------------------------------------------
-def analyze_file_pair(previous_file, refresh_file, output_path):
-
-    print("Preparing files:", os.path.basename(previous_file), "vs", os.path.basename(refresh_file))
-
-    previous_file = convert_to_parquet(previous_file)
-    refresh_file = convert_to_parquet(refresh_file)
-
-    prev_sample = load_sample(previous_file)
-    new_sample = load_sample(refresh_file)
-
-    prev_cols = prev_sample.columns
-    new_cols = new_sample.columns
-
-    # -----------------------------------------------------
-    # COLUMN ORDER VALIDATION
-    # -----------------------------------------------------
-    order_results = []
-
-    max_len = max(len(prev_cols), len(new_cols))
-
-    for i in range(max_len):
-
-        prev = prev_cols[i] if i < len(prev_cols) else ""
-        new = new_cols[i] if i < len(new_cols) else ""
-
-        status = "OK" if prev == new else "DIFFERENT"
-
-        order_results.append({
-            "position": i + 1,
-            "previous_column": prev,
-            "refresh_column": new,
-            "status": status
-        })
-
-    order_df = pd.DataFrame(order_results)
-
-    # -----------------------------------------------------
-    # MISSING / EXTRA
-    # -----------------------------------------------------
-    missing_cols = list(set(prev_cols) - set(new_cols))
-    extra_cols = list(set(new_cols) - set(prev_cols))
-
-    missing_df = pd.DataFrame({"missing_columns": missing_cols})
-    extra_df = pd.DataFrame({"extra_columns": extra_cols})
-
-    # -----------------------------------------------------
-    # FORMAT DETECTION
-    # -----------------------------------------------------
-    prev_formats = {}
-    new_formats = {}
-
-    for col in prev_cols:
-        prev_formats[col] = detect_format(prev_sample[col])
-
-    for col in new_cols:
-        new_formats[col] = detect_format(new_sample[col])
-
-    format_rows = []
-
-    for col in prev_cols:
-
-        format_rows.append({
-            "column": col,
-            "previous_format": prev_formats[col],
-            "refresh_format": new_formats.get(col, "missing")
-        })
-
-    format_df = pd.DataFrame(format_rows)
-
-    # -----------------------------------------------------
-    # COLUMN SIMILARITY
-    # -----------------------------------------------------
-    similarity_lookup = compute_similarity_matrix(prev_cols, new_cols)
-    similarity_rows = []
-    similarity_lookup = compute_similarity_matrix(prev_cols, new_cols)
-
-    for p in prev_cols:
-
-        for n in new_cols:
-
-            similarity = similarity_lookup[(p, n)]
-
-            similarity_rows.append({
-                "previous_column": p,
-                "refresh_column": n,
-                "header_similarity": similarity["header_similarity"],
-                "semantic_similarity": similarity["semantic_similarity"]
-            })
-
-    similarity_df = pd.DataFrame(similarity_rows)
-
-    # -----------------------------------------------------
-    # AI COLUMN MAPPING
-    # -----------------------------------------------------
-    mapping_rows = []
-
-    for p in prev_cols:
-
-        best_match = None
-        best_score = 0
-
-        for n in new_cols:
-
-            similarity = similarity_lookup[(p, n)]
-            header_score = similarity["header_similarity"]
-            semantic_score = similarity["semantic_similarity_raw"]
-
-            format_score = 1 if prev_formats[p] == new_formats.get(n) else 0
-
-            score = (semantic_score * 0.5) + (header_score * 0.3) + (format_score * 0.2)
-
-            if score > best_score:
-
-                best_score = score
-                best_match = n
-
-        mapping_rows.append({
-            "previous_column": p,
-            "suggested_refresh_column": best_match,
-            "confidence_score": round(best_score, 3),
-            "previous_format": prev_formats[p],
-            "refresh_format": new_formats.get(best_match, "")
-        })
-
-    mapping_df = pd.DataFrame(mapping_rows)
-
-    # -----------------------------------------------------
-    # SAVE REPORT
-    # -----------------------------------------------------
-    with pd.ExcelWriter(output_path) as writer:
-
-        order_df.to_excel(writer, sheet_name="column_order", index=False)
-        missing_df.to_excel(writer, sheet_name="missing_columns", index=False)
-        extra_df.to_excel(writer, sheet_name="extra_columns", index=False)
-        format_df.to_excel(writer, sheet_name="format_analysis", index=False)
-        similarity_df.to_excel(writer, sheet_name="column_similarity", index=False)
-        mapping_df.to_excel(writer, sheet_name="embedding_mapping", index=False)
-
-    print("Analysis complete:", output_path)
-
+    elif file_path.lower().endswith(".xlsx"):
+        df = pl.read_excel(file_path, engine="openpyxl")
+        df.write_csv(cached_path)
+        return cached_path
+
+    else:
+        raise ValueError("Unsupported file format")
+
+def get_columns(file_path):
+    csv_path = convert_to_csv(file_path)
+    return pl.scan_csv(csv_path).collect_schema().names()
+
+# Text normalization
+def normalize(text):
+    text = text.lower().strip()
+    text = re.sub(r'[\s_\-]+', ' ', text)
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\d+', '', text)
+    return f"This column represents {text}"
+
+# Embeddings
+def encode_batch(texts):
+    return model.encode(texts, batch_size=32)
+
+# Structure Validation
+def validate_structure(cols_old, cols_new):
     return {
-        "previous_columns": len(prev_cols),
-        "refresh_columns": len(new_cols),
-        "missing_columns": len(missing_cols),
-        "extra_columns": len(extra_cols)
+        "same_count": len(cols_old) == len(cols_new),
+        "same_order": cols_old == cols_new,
+        "missing": list(set(cols_old) - set(cols_new)),
+        "new": list(set(cols_new) - set(cols_old)),
+        "reordered": set(cols_old) == set(cols_new) and cols_old != cols_new
     }
 
+# String-based similarity
+def token_overlap(a, b):
+    a_set = set(a.split())
+    b_set = set(b.split())
+    return len(a_set & b_set) / max(len(a_set), 1)
 
-def analyze_folder_pairs(previous_folder, refresh_folder, output_folder):
+# Column Matching Engine
+def match_columns(old_cols, new_cols):
+    if not old_cols or not new_cols:
+        return []
 
-    print("Indexing folders...")
+    old_proc = [normalize(c) for c in old_cols]
+    new_proc = [normalize(c) for c in new_cols]
 
-    previous_index = index_folder_files(previous_folder)
-    refresh_index = index_folder_files(refresh_folder)
+    old_emb = encode_batch(old_proc)
+    new_emb = encode_batch(new_proc)
 
-    previous_keys = set(previous_index.keys())
-    refresh_keys = set(refresh_index.keys())
+    sim_matrix = util.cos_sim(old_emb, new_emb)
 
-    matched_keys = sorted(previous_keys & refresh_keys)
-    missing_in_refresh = sorted(previous_keys - refresh_keys)
-    extra_in_refresh = sorted(refresh_keys - previous_keys)
+    matches = []
 
-    summary_rows = []
+    for i, old_col in enumerate(old_cols):
+        best_j = sim_matrix[i].argmax()
+        cos_score = sim_matrix[i][best_j].item()
 
-    for key in matched_keys:
+        lexical_score = token_overlap(old_proc[i], new_proc[best_j])
 
-        previous_item = previous_index[key]
-        refresh_item = refresh_index[key]
+        final_score = 0.7 * cos_score + 0.3 * lexical_score
 
-        report_name = f"etl_schema_analysis_{safe_sheet_name(key)}.xlsx"
-        report_path = os.path.join(output_folder, report_name)
+        if final_score > SIM_THRESHOLD_LOW:
+            matches.append({
+                "old": old_col,
+                "new": new_cols[best_j],
+                "score": round(final_score, 3),
+                "confidence": (
+                    "high" if final_score > SIM_THRESHOLD_HIGH else "medium"
+                )
+            })
 
-        stats = analyze_file_pair(
-            previous_item["path"],
-            refresh_item["path"],
-            report_path
-        )
+    return matches
 
-        summary_rows.append({
-            "dataset_key": key,
-            "previous_file": previous_item["name"],
-            "refresh_file": refresh_item["name"],
-            "status": "analyzed",
-            "report_path": report_path,
-            **stats
-        })
+# Report generation
+def generate_report(structure, matches):
+    lines = []
+    lines.append("=== SCHEMA VALIDATION REPORT ===\n")
 
-    for key in missing_in_refresh:
-        summary_rows.append({
-            "dataset_key": key,
-            "previous_file": previous_index[key]["name"],
-            "refresh_file": "",
-            "status": "missing_in_refresh",
-            "report_path": "",
-            "previous_columns": "",
-            "refresh_columns": "",
-            "missing_columns": "",
-            "extra_columns": ""
-        })
+    lines.append(f"Same column count: {structure['same_count']}")
+    lines.append(f"Same order: {structure['same_order']}")
+    lines.append(f"Reordered: {structure['reordered']}\n")
 
-    for key in extra_in_refresh:
-        summary_rows.append({
-            "dataset_key": key,
-            "previous_file": "",
-            "refresh_file": refresh_index[key]["name"],
-            "status": "extra_in_refresh",
-            "report_path": "",
-            "previous_columns": "",
-            "refresh_columns": "",
-            "missing_columns": "",
-            "extra_columns": ""
-        })
+    lines.append(f"Missing columns: {structure['missing']}")
+    lines.append(f"New columns: {structure['new']}\n")
 
-    summary_path = os.path.join(output_folder, "etl_schema_batch_summary.xlsx")
-    pd.DataFrame(summary_rows).to_excel(summary_path, index=False)
+    if matches:
+        lines.append("Predicted column mappings:")
+        for m in matches:
+            lines.append(
+                f"{m['old']} → {m['new']} "
+                f"(score: {m['score']}, {m['confidence']})"
+            )
+    else:
+        lines.append("No meaningful matches found.")
 
-    print("Batch analysis complete:", summary_path)
+    return "\n".join(lines)
 
+# Main Pipeline
+def run_pipeline(file_old, file_new):
+    cols_old = get_columns(file_old)
+    cols_new = get_columns(file_new)
 
-# ---------------------------------------------------------
-# TKINTER UI
-# ---------------------------------------------------------
-def run_ui():
+    structure = validate_structure(cols_old, cols_new)
+    matches = match_columns(structure["missing"], structure["new"])
 
-    root = tk.Tk()
-    root.withdraw()
+    return generate_report(structure, matches)
 
-    previous_folder = filedialog.askdirectory(
-        title="Select PREVIOUS refresh folder"
-    )
+# UI
+def select_old():
+    path = filedialog.askopenfilename(title="Select Previous File")
+    old_var.set(path)
 
-    refresh_folder = filedialog.askdirectory(
-        title="Select CURRENT refresh folder"
-    )
+def select_new():
+    path = filedialog.askopenfilename(title="Select Current File")
+    new_var.set(path)
 
-    output_folder = filedialog.askdirectory(
-        title="Select OUTPUT folder"
-    )
+def execute():
+    old_file = old_var.get()
+    new_file = new_var.get()
 
-    def run():
+    if not old_file or not new_file:
+        messagebox.showerror("Error", "Select both files")
+        return
 
-        analyze_folder_pairs(previous_folder, refresh_folder, output_folder)
+    try:
+        result = run_pipeline(old_file, new_file)
+        output.delete(1.0, tk.END)
+        output.insert(tk.END, result)
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
 
-        print("Finished.")
-        root.quit()
+# Tkinter
+root = tk.Tk()
+root.title("Schema Drift Detection Tool")
+root.geometry("800x600")
 
-    threading.Thread(target=run).start()
+old_var = tk.StringVar()
+new_var = tk.StringVar()
 
-    root.mainloop()
+tk.Label(root, text="Previous File").pack()
+tk.Entry(root, textvariable=old_var, width=90).pack()
+tk.Button(root, text="Browse", command=select_old).pack()
 
+tk.Label(root, text="Current File").pack()
+tk.Entry(root, textvariable=new_var, width=90).pack()
+tk.Button(root, text="Browse", command=select_new).pack()
 
-# ---------------------------------------------------------
-# RUN
-# ---------------------------------------------------------
-if __name__ == "__main__":
-    run_ui()
+tk.Button(root, text="Run Validation", command=execute, bg="green", fg="white").pack(pady=10)
+
+output = tk.Text(root, wrap="word")
+output.pack(expand=True, fill="both")
+
+root.mainloop()
